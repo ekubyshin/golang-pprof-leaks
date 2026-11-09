@@ -1,0 +1,4 @@
+profiles/
+*.test
+*.out
+.DS_Store

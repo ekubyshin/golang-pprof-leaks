@@ -1,0 +1,67 @@
+services:
+  http_leak:
+    build: ./http_leak
+    container_name: http_leak
+    ports:
+      - "127.0.0.1:8080:8080"
+    healthcheck: &healthcheck
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+      start_period: 3s
+
+  goroutine_leak:
+    build: ./goroutine_leak
+    container_name: goroutine_leak
+    ports:
+      - "127.0.0.1:8091:8080"
+    healthcheck: *healthcheck
+
+  client_leak:
+    build: ./client_leak
+    container_name: client_leak
+    ports:
+      - "127.0.0.1:8092:8080"
+    healthcheck: *healthcheck
+
+  ctx_leak:
+    build: ./ctx_leak
+    container_name: ctx_leak
+    ports:
+      - "127.0.0.1:8093:8080"
+    healthcheck: *healthcheck
+
+  db_leak:
+    build: ./db_leak
+    container_name: db_leak
+    ports:
+      - "127.0.0.1:8094:8080"
+    healthcheck: *healthcheck
+
+  k6:
+    image: grafana/k6:0.57.0
+    container_name: k6
+    depends_on:
+      http_leak:
+        condition: service_healthy
+      goroutine_leak:
+        condition: service_healthy
+      client_leak:
+        condition: service_healthy
+      ctx_leak:
+        condition: service_healthy
+      db_leak:
+        condition: service_healthy
+    environment:
+      TARGET_PATH: ${TARGET_PATH:-/leak}
+      DURATION: ${DURATION:-2m}
+      RPS: ${RPS:-50}
+      RPS_GOROUTINE: ${RPS_GOROUTINE:-20}
+      RPS_CLIENT: ${RPS_CLIENT:-20}
+      RPS_CTX: ${RPS_CTX:-20}
+      RPS_DB: ${RPS_DB:-10}
+    volumes:
+      - ./k6:/scripts:ro
+    command: ["run", "/scripts/load.js"]
+    restart: "no"
