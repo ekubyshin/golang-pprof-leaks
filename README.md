@@ -143,21 +143,29 @@ curl -fsS 'http://127.0.0.1:8080/debug/pprof/goroutine?debug=1' | head -n 40
 
 ### 4. Снять два профиля со всех сервисов и посчитать diff
 
-Второй терминал, пока k6 ещё работает (окно нагрузки — две минуты). [`scripts/capture-profiles.sh`](scripts/capture-profiles.sh) обходит пять сервисных контейнеров, пишет heap и goroutine на хост, через 30 секунд снимает те же профили ещё раз и для каждого файла считает `-base`. k6 в обход не входит.
+Второй терминал, пока k6 ещё работает (окно нагрузки — две минуты). [`scripts/capture-profiles.sh`](scripts/capture-profiles.sh) обходит пять сервисных контейнеров, пишет heap и goroutine на хост, через 60 секунд снимает те же профили ещё раз и для каждого файла считает `-base`. k6 в обход не входит.
 
 ```bash
 ./scripts/capture-profiles.sh
 ```
 
-Другая пауза, в секундах: `./scripts/capture-profiles.sh 45`. Файлы лежат в `profiles/<сервис>.heap1.pb.gz` и `profiles/<сервис>.goroutine2.pb.gz`: первая цифра — снимок, имя — контейнер.
+Другая пауза, в секундах: `./scripts/capture-profiles.sh 45`. Два снимка вручную, паузу между ними выбираете сами:
 
-Веб-интерфейс с `-diff_base` для одного сервиса открывает [`scripts/pprof-diff.sh`](scripts/pprof-diff.sh): goroutine на `9091`, heap на `9090`. Оба процесса живут, пока скрипт не остановите.
+```bash
+./scripts/capture-first.sh
+./scripts/capture-second.sh
+```
+
+Файлы лежат в `profiles/<сервис>.heap1.pb.gz` и `profiles/<сервис>.goroutine2.pb.gz`: первая цифра — снимок, имя — контейнер.
+
+Веб-интерфейс с `-diff_base` открывает [`scripts/pprof-diff.sh`](scripts/pprof-diff.sh): один `pprof` в переднем плане, как ручной запуск. Heap по умолчанию на `9999`. Процесс живёт, пока его не остановите.
 
 ```bash
 ./scripts/pprof-diff.sh http_leak
+./scripts/pprof-diff.sh http_leak goroutine
 ```
 
-Имена: `http_leak`, `goroutine_leak`, `client_leak`, `ctx_leak`, `db_leak`. Второй сервис одновременно — со сдвигом портов: `./scripts/pprof-diff.sh client_leak 9093 9092`.
+Имена: `http_leak`, `goroutine_leak`, `client_leak`, `ctx_leak`, `db_leak`. Goroutine по умолчанию на `9998`. Другой порт: `./scripts/pprof-diff.sh client_leak heap 9992`. Если скрипт пишет «дельта нулевая», снимки совпали и график пустой: пара снята, когда счётчик в логе уже стоял.
 
 Как читать результат:
 

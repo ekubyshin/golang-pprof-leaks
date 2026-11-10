@@ -7,7 +7,7 @@ import { check, sleep } from 'k6';
 const path = (__ENV.TARGET_PATH || '/leak').startsWith('/')
   ? __ENV.TARGET_PATH || '/leak'
   : `/${__ENV.TARGET_PATH}`;
-const duration = __ENV.DURATION || '10m';
+const duration = __ENV.DURATION || '5m';
 
 const services = [
   { name: 'body', base: __ENV.URL_BODY || 'http://http_leak:8080', rps: Number(__ENV.RPS || 50) },
