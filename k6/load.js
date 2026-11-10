@@ -7,14 +7,14 @@ import { check, sleep } from 'k6';
 const path = (__ENV.TARGET_PATH || '/leak').startsWith('/')
   ? __ENV.TARGET_PATH || '/leak'
   : `/${__ENV.TARGET_PATH}`;
-const duration = __ENV.DURATION || '2m';
+const duration = __ENV.DURATION || '10m';
 
 const services = [
   { name: 'body', base: __ENV.URL_BODY || 'http://http_leak:8080', rps: Number(__ENV.RPS || 50) },
-  { name: 'goroutine', base: __ENV.URL_GOROUTINE || 'http://goroutine_leak:8080', rps: Number(__ENV.RPS_GOROUTINE || 20) },
-  { name: 'client', base: __ENV.URL_CLIENT || 'http://client_leak:8080', rps: Number(__ENV.RPS_CLIENT || 20) },
-  { name: 'ctx', base: __ENV.URL_CTX || 'http://ctx_leak:8080', rps: Number(__ENV.RPS_CTX || 20) },
-  { name: 'db', base: __ENV.URL_DB || 'http://db_leak:8080', rps: Number(__ENV.RPS_DB || 10) },
+  { name: 'goroutine', base: __ENV.URL_GOROUTINE || 'http://goroutine_leak:8080', rps: Number(__ENV.RPS_GOROUTINE || 50) },
+  { name: 'client', base: __ENV.URL_CLIENT || 'http://client_leak:8080', rps: Number(__ENV.RPS_CLIENT || 50) },
+  { name: 'ctx', base: __ENV.URL_CTX || 'http://ctx_leak:8080', rps: Number(__ENV.RPS_CTX || 50) },
+  { name: 'db', base: __ENV.URL_DB || 'http://db_leak:8080', rps: Number(__ENV.RPS_DB || 50) },
 ];
 
 const urls = {};

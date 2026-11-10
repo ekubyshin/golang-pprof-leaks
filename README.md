@@ -141,41 +141,30 @@ curl -fsS 'http://127.0.0.1:8080/debug/pprof/goroutine?debug=1' | head -n 40
 
 `debug=2` добавляет к кадрам аргументы. В них могут быть URL и заголовки, поэтому для демонстрации хватает `debug=1`.
 
-### 4. Снять два профиля и посчитать diff
+### 4. Снять два профиля со всех сервисов и посчитать diff
 
-Второй терминал, пока k6 ещё работает (окно нагрузки — две минуты). Снимки пишутся на хост, pprof смотрит уже файлы:
-
-```bash
-mkdir -p profiles
-curl -fsS http://127.0.0.1:8080/debug/pprof/heap -o profiles/heap1.pb.gz
-curl -fsS http://127.0.0.1:8080/debug/pprof/goroutine -o profiles/goroutine1.pb.gz
-sleep 20
-curl -fsS http://127.0.0.1:8080/debug/pprof/heap -o profiles/heap2.pb.gz
-curl -fsS http://127.0.0.1:8080/debug/pprof/goroutine -o profiles/goroutine2.pb.gz
-```
-
-Паузу между снимками можно поставить другую: замените `sleep 20`. Дальше:
+Второй терминал, пока k6 ещё работает (окно нагрузки — две минуты). [`scripts/capture-profiles.sh`](scripts/capture-profiles.sh) обходит пять сервисных контейнеров, пишет heap и goroutine на хост, через 30 секунд снимает те же профили ещё раз и для каждого файла считает `-base`. k6 в обход не входит.
 
 ```bash
-go tool pprof -top -cum -base \
-  profiles/goroutine1.pb.gz profiles/goroutine2.pb.gz
-
-go tool pprof -http=127.0.0.1:9091 -diff_base \
-  profiles/goroutine1.pb.gz profiles/goroutine2.pb.gz
-
-go tool pprof -top -cum -inuse_space -base \
-  profiles/heap1.pb.gz profiles/heap2.pb.gz
-
-go tool pprof -http=127.0.0.1:9090 -diff_base \
-  profiles/heap1.pb.gz profiles/heap2.pb.gz
+./scripts/capture-profiles.sh
 ```
+
+Другая пауза, в секундах: `./scripts/capture-profiles.sh 45`. Файлы лежат в `profiles/<сервис>.heap1.pb.gz` и `profiles/<сервис>.goroutine2.pb.gz`: первая цифра — снимок, имя — контейнер.
+
+Веб-интерфейс с `-diff_base` для одного сервиса открывает [`scripts/pprof-diff.sh`](scripts/pprof-diff.sh): goroutine на `9091`, heap на `9090`. Оба процесса живут, пока скрипт не остановите.
+
+```bash
+./scripts/pprof-diff.sh http_leak
+```
+
+Имена: `http_leak`, `goroutine_leak`, `client_leak`, `ctx_leak`, `db_leak`. Второй сервис одновременно — со сдвигом портов: `./scripts/pprof-diff.sh client_leak 9093 9092`.
 
 Как читать результат:
 
-- **`-base`** вычитает первый снимок из второго. В `-top` проценты считаются от дельты, колонка `cum` показывает, сколько стеков прибавилось. За 20 секунд при 50 RPS это около тысячи `readLoop`, тысячи `writeLoop` и тысячи `conn.serve`.
+- **`-base`** вычитает первый снимок из второго. В `-top` проценты считаются от дельты, колонка `cum` показывает, сколько стеков прибавилось. У `http_leak` за 30 секунд при 50 RPS это около полутора тысяч `readLoop`, `writeLoop` и `conn.serve`. У остальных сервисов дельта меньше и другая по составу: ориентиры в разделе ниже.
 - **`-diff_base`** нужен веб-интерфейсу: Top, Graph, Flame Graph, Source. В текстовом `-top` проценты в этом режиме легко уезжают за 100%, потому что знаменатель — размер базового снимка. Ориентир — абсолютные числа.
 - Оба флага вместе передать нельзя.
-- В heap по **`inuse_space`** в приросте видны `bufio.NewReaderSize`, `bufio.NewWriterSize` и `net/http.(*Transport).dialConn`.
+- В heap по **`inuse_space`** в приросте `http_leak` и `client_leak` видны `bufio.NewReaderSize`, `bufio.NewWriterSize` и `net/http.(*Transport).dialConn`.
 - **`alloc_space`** за то же окно часто подсвечивает сам сбор профиля (`runtime/pprof`, `compress/flate`). Это аллокации, которые к следующему GC уже могут умереть. Утечку смотрим по `inuse_space` и по горутинам.
 - В UI у heap есть переключатель sample: `inuse_space` для живых объектов, `alloc_space` для суммарных аллокаций. По умолчанию открывается `inuse_space`.
 - Graph требует `dot`. Если его нет, оставайтесь в Top, Flame Graph и Source.
@@ -221,13 +210,13 @@ docker compose logs -f ctx_leak
 - `client_leak` — около +120 за две секунды: `readLoop`, `writeLoop` и `conn.serve` downstream в том же процессе. Body при этом закрыт
 - `db_leak` — около +20 `rows` и `conns_in_use` за две секунды. Горутины при этом почти не растут: соединение просто не возвращается в пул. В логе это поля `rows` и `conns_in_use`. После `GET /gc` они остаются
 
-Дамп и diff снимаются так же, только порт другой. Для горутин:
+Два снимка и текстовый `-base` по всем пяти сервисам считает `./scripts/capture-profiles.sh`. Текстовый дамп горутин одного сервиса:
 
 ```bash
 curl -fsS 'http://127.0.0.1:8091/debug/pprof/goroutine?debug=1' | head -n 20
 ```
 
-Для клиента, контекста и базы порты `8092`, `8093` и `8094`. `go tool pprof -http=127.0.0.1:9091` открывает профиль с того URL, который ему передали.
+Для клиента, контекста и базы порты `8092`, `8093` и `8094`. Те же пути, что у `http_leak`: `/debug/pprof/`, `heap`, `goroutine`, `allocs`.
 
 В `db_leak` смотреть в первую очередь счётчик соединений, не профиль горутин:
 
