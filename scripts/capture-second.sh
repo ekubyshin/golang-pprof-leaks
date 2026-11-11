@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Второй снимок heap и goroutine с пяти сервисов: profiles/<сервис>.heap2.pb.gz
+# Второй снимок heap и goroutine с шести сервисов: profiles/<сервис>.heap2.pb.gz
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -12,6 +12,7 @@ services=(
   client_leak:8092
   ctx_leak:8093
   db_leak:8094
+  tx_leak:8095
 )
 
 for spec in "${services[@]}"; do

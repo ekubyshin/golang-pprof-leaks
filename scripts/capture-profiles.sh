@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Снимает heap и goroutine с пяти сервисов, ждёт и снимает ещё раз, затем печатает -base.
+# Снимает heap и goroutine с шести сервисов, ждёт и снимает ещё раз, затем печатает -base.
 # Пауза в секундах — первый аргумент, по умолчанию 30.
 set -euo pipefail
 
@@ -15,6 +15,7 @@ services=(
   client_leak:8092
   ctx_leak:8093
   db_leak:8094
+  tx_leak:8095
 )
 
 snap() {

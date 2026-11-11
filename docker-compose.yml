@@ -39,6 +39,13 @@ services:
       - "127.0.0.1:8094:8080"
     healthcheck: *healthcheck
 
+  tx_leak:
+    build: ./tx_leak
+    container_name: tx_leak
+    ports:
+      - "127.0.0.1:8095:8080"
+    healthcheck: *healthcheck
+
   k6:
     image: grafana/k6:0.57.0
     container_name: k6
@@ -53,6 +60,8 @@ services:
         condition: service_healthy
       db_leak:
         condition: service_healthy
+      tx_leak:
+        condition: service_healthy
     environment:
       TARGET_PATH: ${TARGET_PATH:-/leak}
       DURATION: ${DURATION:-2m}
@@ -61,6 +70,7 @@ services:
       RPS_CLIENT: ${RPS_CLIENT:-20}
       RPS_CTX: ${RPS_CTX:-20}
       RPS_DB: ${RPS_DB:-10}
+      RPS_TX: ${RPS_TX:-10}
     volumes:
       - ./k6:/scripts:ro
     command: ["run", "/scripts/load.js"]

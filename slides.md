@@ -272,21 +272,21 @@ GC их не забирает: стек горутины — живой коре
 
 # Причины утечек
 
-Инцидент на проде — незакрытый Body. Дальше те же корни в других местах: горутина, Transport, cancel, Rows.
+Инцидент на проде — незакрытый Body. Дальше те же корни в других местах: горутина, Transport, cancel, Rows, транзакция.
 
-Пять сервисов `*_leak`. Нагрузка снаружи, чтобы на счётчиках и в pprof было видно, как течь растёт.
+Шесть сервисов `*_leak`. Нагрузка снаружи, чтобы на счётчиках и в pprof было видно, как течь растёт.
 
 <!--
 Сначала TARGET_PATH=/fixed DURATION=30s docker compose up -d
 Потом docker compose down и docker compose up -d
 Логи: docker compose logs -f http_leak
-и так же goroutine_leak, client_leak, ctx_leak, db_leak.
+и так же goroutine_leak, client_leak, ctx_leak, db_leak, tx_leak.
 Команды есть в README.
 -->
 
 ---
 
-# Пять процессов, один compose
+# Шесть процессов, один compose
 
 | Сервис | Порт | На `/leak` |
 | --- | --- | --- |
@@ -295,6 +295,7 @@ GC их не забирает: стек горутины — живой коре
 | `client_leak` | 8092 | новый `Transport` на запрос |
 | `ctx_leak` | 8093 | `cancel` не вызван |
 | `db_leak` | 8094 | `sql.Rows` не закрыты |
+| `tx_leak` | 8095 | транзакция без `Commit` и `Rollback` |
 
 k6 закрывает ответы сервисов и сам память не копит. `/fixed` делает тот же вызов без утечки. pprof у каждого свой, например `127.0.0.1:8080/debug/pprof/`.
 
@@ -307,11 +308,11 @@ TARGET_PATH=/fixed DURATION=30s docker compose up -d
 docker compose down && docker compose up -d
 ```
 
-Второй запуск две минуты бьёт в `/leak` на всех пяти: 50 RPS в `http_leak`, по 20 в горутины, клиент и контекст, 10 в базу.
+Второй запуск две минуты бьёт в `/leak` на всех шести: 50 RPS в `http_leak`, по 20 в горутины, клиент и контекст, по 10 в базу и транзакции.
 
 Лог самого шумного: `docker compose logs -f http_leak`. У остальных контейнер называется так же, как сервис.
 
-`(+N)` считается от старта процесса и пишется в лог. `GET /gc` делает сборку мусора и печатает снимок без `(+N)`. У `db_leak` в этой строке ещё `conns_in_use` и `rows`. Сравниваем `/fixed` и `/leak` на свежем процессе: уже открытые соединения и горутины живут до его завершения.
+`(+N)` считается от старта процесса и пишется в лог. `GET /gc` делает сборку мусора и печатает снимок без `(+N)`. У `db_leak` в этой строке ещё `conns_in_use` и `rows`, у `tx_leak` — `conns_in_use` и `tx`. Сравниваем `/fixed` и `/leak` на свежем процессе: уже открытые соединения и горутины живут до его завершения.
 
 ---
 
@@ -440,6 +441,47 @@ func leaky(db *sql.DB) error {
 
 ---
 
+<!-- _class: dense -->
+
+# Транзакция без `Commit` и `Rollback`
+
+`BeginTx` держит соединение пула, пока нет `Commit` или `Rollback`. `Begin` и `BeginTx(context.Background())` не отменяются вместе с входящим запросом.
+
+`database/sql` на каждую транзакцию запускает `(*Tx).awaitDone`. Горутина стоит на `ctx.Done()`. В логе растут `tx`, `conns_in_use` и число горутин. Куча почти стоит: сессия живёт в базе.
+
+Для базы это отдельный ущерб:
+
+- сессия занимает слот на сервере, пул `max_connections` кончается раньше памяти приложения
+- незакоммиченный `UPDATE` держит блокировки строк, другие запросы ждут или получают deadlock
+- в PostgreSQL снимок транзакции не даёт `VACUUM` убрать старые версии строк, таблица и индексы раздуваются
+- в SQLite этого демо читатель держит shared-блокировку: писатель ждёт. В WAL длинное чтение мешает checkpoint
+
+---
+
+# `tx_leak`: транзакция не закрыта
+
+```go
+func leaky(db *sql.DB) error {
+    tx, err := db.BeginTx(context.Background(), nil)
+    if err != nil {
+        return err
+    }
+    var n int
+    if err := tx.QueryRow(`SELECT COUNT(*) FROM items`).Scan(&n); err != nil {
+        _ = tx.Rollback()
+        return err
+    }
+    openTx = append(openTx, tx)
+    return nil
+}
+```
+
+`/fixed` делает `defer tx.Rollback()` и затем `Commit`. Срез нужен для счётчика: `awaitDone` и так держит `*sql.Tx`.
+
+При 10 RPS за две секунды около +20 горутин и +20 `conns_in_use`. `GET /gc` их не уменьшает. Чтение не останавливает других читателей. Незакоммиченная запись остановила бы писателя.
+
+---
+
 # Какой профиль открывать
 
 | Вопрос | Профиль |
@@ -454,7 +496,7 @@ go tool pprof -http=127.0.0.1:9091 http://127.0.0.1:8080/debug/pprof/goroutine
 go tool pprof -http=127.0.0.1:9090 http://127.0.0.1:8080/debug/pprof/heap
 ```
 
-У `db_leak` горутины почти стоят: смотрите `conns_in_use` и heap. У `ctx_leak` горутины растут, а heap часто пустой.
+У `db_leak` горутины почти стоят: смотрите `conns_in_use` и heap. У `tx_leak` рядом с `conns_in_use` растёт `(*Tx).awaitDone`. У `ctx_leak` горутины растут, а heap часто пустой.
 
 На этих утечках CPU-профиль почти пустой: горутины спят. Их показывает профиль горутин.
 
@@ -521,10 +563,11 @@ go tool pprof -http=127.0.0.1:9091 -diff_base \
 | `client_leak` | те же три кадра, что у `http_leak` | плюс `http.Transport` |
 | `ctx_leak` | приём из `ctx.Done()` | часто пусто |
 | `db_leak` | новой широкой полосы нет | `database/sql`, sqlite |
+| `tx_leak` | `(*Tx).awaitDone` | `database/sql`, sqlite |
 
 Одинаковые `readLoop` у `http_leak` и `client_leak` разделяет heap: во втором на запрос появляется `Transport`.
 
-Пустой goroutine-diff при растущем `conns_in_use` — повод открыть heap и статистику пула.
+Пустой goroutine-diff при растущем `conns_in_use` — это `db_leak`: смотрите heap и статистику пула. У `tx_leak` рядом растёт `awaitDone`.
 
 ---
 
@@ -554,7 +597,7 @@ CPU-профиль на 20 секунд заметно грузит процес
 1. **Горутины** запускаются на запрос и не выходят: канал, `WaitGroup`, вызов без таймаута
 2. **Новый `Transport` на запрос** с нулевым `IdleConnTimeout`: простой без предела. Пустой `Client.Transport` — общий `DefaultTransport`
 3. **`resp.Body`** не закрыт
-4. **`sql.Rows` без `Close`** держит соединение. Файл без `Close` держит дескриптор, пока жива ссылка на `*os.File`
+4. **`sql.Rows` без `Close`** и **`Tx` без `Commit`/`Rollback`** держат соединение базы. Файл без `Close` держит дескриптор, пока жива ссылка
 5. **Map, кэш, очередь** без верхней границы и без TTL
 6. **Вечный `time.Tick` / `NewTicker`.** Горутина держит тикер. С Go 1.23 тикер без ссылок собирает GC
 7. **Короткий срез** удерживает большой backing array
@@ -598,6 +641,6 @@ func poll() {
 2. Логи, затем число и стеки горутин
 3. pprof с живого процесса: goroutine, heap, Source
 4. Diff двух снимков при том же RPS
-5. На ревью: один `Transport` с ненулевым `IdleConnTimeout`, `defer Close` у Body и Rows, чтение до EOF, `cancel()` у контекста от долгого родителя
+5. На ревью: один `Transport` с ненулевым `IdleConnTimeout`, `defer Close` у Body и Rows, `defer Rollback()` у `Tx`, чтение до EOF, `cancel()` у долгого контекста
 
 Если процесс уже перезапустился, разовый профиль пустой. Постоянный сбор тех же профилей оставляет снимки до рестарта.

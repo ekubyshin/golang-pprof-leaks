@@ -1,5 +1,5 @@
 // Нагрузка на все сервисы демо.
-// TARGET_PATH, DURATION, RPS, RPS_GOROUTINE, RPS_CLIENT, RPS_CTX, RPS_DB приходят из compose.
+// TARGET_PATH, DURATION, RPS, RPS_GOROUTINE, RPS_CLIENT, RPS_CTX, RPS_DB, RPS_TX приходят из compose.
 import exec from 'k6/execution';
 import http from 'k6/http';
 import { check, sleep } from 'k6';
@@ -15,6 +15,7 @@ const services = [
   { name: 'client', base: __ENV.URL_CLIENT || 'http://client_leak:8080', rps: Number(__ENV.RPS_CLIENT || 50) },
   { name: 'ctx', base: __ENV.URL_CTX || 'http://ctx_leak:8080', rps: Number(__ENV.RPS_CTX || 50) },
   { name: 'db', base: __ENV.URL_DB || 'http://db_leak:8080', rps: Number(__ENV.RPS_DB || 50) },
+  { name: 'tx', base: __ENV.URL_TX || 'http://tx_leak:8080', rps: Number(__ENV.RPS_TX || 10) },
 ];
 
 const urls = {};
