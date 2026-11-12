@@ -9,14 +9,22 @@ import (
 	"net/http"
 	_ "net/http/pprof"
 	"runtime"
-	"strings"
 	"sync"
 	"time"
 
-	_ "modernc.org/sqlite"
+	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
-const countItems = `SELECT COUNT(*) FROM items`
+const insertEvent = `INSERT INTO events(payload) VALUES ($1)`
+
+const sessionSQL = `
+SELECT
+  count(*) FILTER (WHERE state = 'idle') AS idle,
+  count(*) FILTER (WHERE state = 'idle in transaction') AS idle_in_tx,
+  count(*) FILTER (WHERE backend_xmin IS NOT NULL) AS with_xmin
+FROM pg_stat_activity
+WHERE datname = current_database()
+  AND pid <> pg_backend_pid()`
 
 // openTx считает незавершённые транзакции в логе.
 // Срез не обязателен для самой утечки: database/sql запускает (*Tx).awaitDone,
@@ -29,10 +37,11 @@ var (
 
 func main() {
 	addr := flag.String("http", "127.0.0.1:8080", "адрес HTTP и pprof")
+	dsn := flag.String("dsn", "postgres://leak:leak@127.0.0.1:5434/leak?sslmode=disable", "PostgreSQL DSN")
 	flag.Parse()
 	runtime.MemProfileRate = 64 * 1024
 
-	db := openDB()
+	db := openDB(*dsn)
 
 	http.HandleFunc("/", index(*addr))
 	http.HandleFunc("/leak", func(w http.ResponseWriter, r *http.Request) {
@@ -61,52 +70,51 @@ func main() {
 	log.Fatal(server.ListenAndServe())
 }
 
-func openDB() *sql.DB {
-	// cache=shared: одна память на все соединения процесса.
-	db, err := sql.Open("sqlite", "file:txleak?mode=memory&cache=shared")
+func openDB(dsn string) *sql.DB {
+	db, err := sql.Open("pgx", dsn)
 	if err != nil {
 		log.Fatal(err)
 	}
-	// Пул не ограничиваем: каждая незакрытая транзакция забирает своё соединение.
+	// Потолок соединений на сервере Postgres, не в пуле клиента.
 	db.SetMaxOpenConns(0)
+	db.SetMaxIdleConns(2)
 
-	// Одно соединение держим до конца процесса, иначе memory-база исчезнет,
-	// когда закроется последнее.
+	var pingErr error
+	for i := 0; i < 30; i++ {
+		pingErr = db.Ping()
+		if pingErr == nil {
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	if pingErr != nil {
+		log.Fatal(pingErr)
+	}
+
 	pin, err := db.Conn(context.Background())
 	if err != nil {
 		log.Fatal(err)
 	}
 	if _, err := pin.ExecContext(context.Background(), `
-		CREATE TABLE items (
-			id INTEGER PRIMARY KEY,
-			name TEXT NOT NULL,
-			payload TEXT NOT NULL
+		CREATE TABLE IF NOT EXISTS events (
+			id bigint PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
+			payload text NOT NULL
 		)`); err != nil {
 		log.Fatal(err)
-	}
-	payload := strings.Repeat("x", 256)
-	for i := 1; i <= 8; i++ {
-		if _, err := pin.ExecContext(context.Background(),
-			`INSERT INTO items(name, payload) VALUES (?, ?)`,
-			fmt.Sprintf("item-%d", i), payload); err != nil {
-			log.Fatal(err)
-		}
 	}
 	pinned = pin
 	return db
 }
 
-// leaky начинает транзакцию от context.Background и не завершает её.
-// SELECT берёт shared-блокировку SQLite и не мешает таким же читателям.
-// Запись здесь не делается: незакоммиченный UPDATE занял бы писателя,
-// и следующие запросы встали бы в очередь.
+// leaky открывает транзакцию от context.Background и не завершает её.
+// INSERT пишет новую строку, поэтому транзакции не ждут друг друга.
+// UPDATE одной и той же строки держал бы row lock до Commit или Rollback.
 func leaky(db *sql.DB) error {
 	tx, err := db.BeginTx(context.Background(), nil)
 	if err != nil {
 		return err
 	}
-	var n int
-	if err := tx.QueryRow(countItems).Scan(&n); err != nil {
+	if _, err := tx.ExecContext(context.Background(), insertEvent, "x"); err != nil {
 		_ = tx.Rollback()
 		return err
 	}
@@ -122,8 +130,7 @@ func fixed(db *sql.DB) error {
 		return err
 	}
 	defer tx.Rollback()
-	var n int
-	if err := tx.QueryRow(countItems).Scan(&n); err != nil {
+	if _, err := tx.ExecContext(context.Background(), insertEvent, "x"); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -139,6 +146,17 @@ func index(addr string) http.HandlerFunc {
 	}
 }
 
+func pgSessions() (idle, idleInTx, withXmin int) {
+	idle, idleInTx, withXmin = -1, -1, -1
+	if pinned == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_ = pinned.QueryRowContext(ctx, sessionSQL).Scan(&idle, &idleInTx, &withXmin)
+	return
+}
+
 func reportLine(db *sql.DB, base int) string {
 	var m runtime.MemStats
 	runtime.ReadMemStats(&m)
@@ -151,8 +169,9 @@ func reportLine(db *sql.DB, base int) string {
 	if base > 0 {
 		delta = fmt.Sprintf(" (%+5d)", n-base)
 	}
-	return fmt.Sprintf("goroutines=%5d%s  heap_inuse=%4dMiB  conns_open=%d conns_in_use=%d tx=%d  gc=%d",
-		n, delta, m.HeapInuse/1024/1024, st.OpenConnections, st.InUse, nTx, m.NumGC)
+	idle, idleInTx, withXmin := pgSessions()
+	return fmt.Sprintf("goroutines=%5d%s  heap_inuse=%4dMiB  conns_open=%d conns_in_use=%d tx=%d  pg_idle=%d pg_idle_in_tx=%d pg_xmin=%d  gc=%d",
+		n, delta, m.HeapInuse/1024/1024, st.OpenConnections, st.InUse, nTx, idle, idleInTx, withXmin, m.NumGC)
 }
 
 func logStats(db *sql.DB) {

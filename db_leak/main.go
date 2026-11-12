@@ -13,14 +13,23 @@ import (
 	"sync"
 	"time"
 
-	_ "modernc.org/sqlite"
+	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
 const query = `SELECT id, name, payload FROM items`
 
-// openRows держит незакрытые результаты. У *sql.Rows есть финализатор,
-// который вызывает Close, когда на объект больше нет ссылок. Здесь ссылка
-// остаётся, как если бы rows положили в поле структуры и забыли закрыть.
+// Сессии этого сервиса, кроме соединения, с которого снимаем статистику.
+const sessionSQL = `
+SELECT
+  count(*) FILTER (WHERE state = 'idle') AS idle,
+  count(*) FILTER (WHERE state = 'idle in transaction') AS idle_in_tx,
+  count(*) FILTER (WHERE backend_xmin IS NOT NULL) AS with_xmin
+FROM pg_stat_activity
+WHERE datname = current_database()
+  AND pid <> pg_backend_pid()`
+
+// openRows держит незакрытые результаты. database/sql сам Close не вызывает.
+// Срез оставляет *sql.Rows достижимым, как поле структуры, которое забыли закрыть.
 var (
 	rowsMu   sync.Mutex
 	openRows []*sql.Rows
@@ -29,10 +38,11 @@ var (
 
 func main() {
 	addr := flag.String("http", "127.0.0.1:8080", "адрес HTTP и pprof")
+	dsn := flag.String("dsn", "postgres://leak:leak@127.0.0.1:5433/leak?sslmode=disable", "PostgreSQL DSN")
 	flag.Parse()
 	runtime.MemProfileRate = 64 * 1024
 
-	db := openDB()
+	db := openDB(*dsn)
 
 	http.HandleFunc("/", index(*addr))
 	http.HandleFunc("/leak", func(w http.ResponseWriter, r *http.Request) {
@@ -61,35 +71,53 @@ func main() {
 	log.Fatal(server.ListenAndServe())
 }
 
-func openDB() *sql.DB {
-	// cache=shared: одна память на все соединения процесса.
-	db, err := sql.Open("sqlite", "file:rowsleak?mode=memory&cache=shared")
+func openDB(dsn string) *sql.DB {
+	db, err := sql.Open("pgx", dsn)
 	if err != nil {
 		log.Fatal(err)
 	}
-	// Пул не ограничиваем: каждое незакрытое Rows забирает своё соединение.
+	// Потолок соединений на сервере Postgres, не в пуле клиента.
 	db.SetMaxOpenConns(0)
+	db.SetMaxIdleConns(2)
 
-	// Одно соединение держим до конца процесса, иначе memory-база исчезнет,
-	// когда закроется последнее.
+	var pingErr error
+	for i := 0; i < 30; i++ {
+		pingErr = db.Ping()
+		if pingErr == nil {
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	if pingErr != nil {
+		log.Fatal(pingErr)
+	}
+
+	// Соединение держим до конца процесса: с него снимаем pg_stat_activity,
+	// не занимая ещё одну сессию на каждый отчёт.
 	pin, err := db.Conn(context.Background())
 	if err != nil {
 		log.Fatal(err)
 	}
 	if _, err := pin.ExecContext(context.Background(), `
-		CREATE TABLE items (
-			id INTEGER PRIMARY KEY,
-			name TEXT NOT NULL,
-			payload TEXT NOT NULL
+		CREATE TABLE IF NOT EXISTS items (
+			id integer PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
+			name text NOT NULL,
+			payload text NOT NULL
 		)`); err != nil {
 		log.Fatal(err)
 	}
-	payload := strings.Repeat("x", 256)
-	for i := 1; i <= 8; i++ {
-		if _, err := pin.ExecContext(context.Background(),
-			`INSERT INTO items(name, payload) VALUES (?, ?)`,
-			fmt.Sprintf("item-%d", i), payload); err != nil {
-			log.Fatal(err)
+	var n int
+	if err := pin.QueryRowContext(context.Background(), `SELECT COUNT(*) FROM items`).Scan(&n); err != nil {
+		log.Fatal(err)
+	}
+	if n == 0 {
+		payload := strings.Repeat("x", 256)
+		for i := 1; i <= 8; i++ {
+			if _, err := pin.ExecContext(context.Background(),
+				`INSERT INTO items(name, payload) VALUES ($1, $2)`,
+				fmt.Sprintf("item-%d", i), payload); err != nil {
+				log.Fatal(err)
+			}
 		}
 	}
 	pinned = pin
@@ -133,6 +161,17 @@ func index(addr string) http.HandlerFunc {
 	}
 }
 
+func pgSessions() (idle, idleInTx, withXmin int) {
+	idle, idleInTx, withXmin = -1, -1, -1
+	if pinned == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_ = pinned.QueryRowContext(ctx, sessionSQL).Scan(&idle, &idleInTx, &withXmin)
+	return
+}
+
 func reportLine(db *sql.DB, base int) string {
 	var m runtime.MemStats
 	runtime.ReadMemStats(&m)
@@ -145,8 +184,9 @@ func reportLine(db *sql.DB, base int) string {
 	if base > 0 {
 		delta = fmt.Sprintf(" (%+5d)", n-base)
 	}
-	return fmt.Sprintf("goroutines=%5d%s  heap_inuse=%4dMiB  conns_open=%d conns_in_use=%d rows=%d  gc=%d",
-		n, delta, m.HeapInuse/1024/1024, st.OpenConnections, st.InUse, nRows, m.NumGC)
+	idle, idleInTx, withXmin := pgSessions()
+	return fmt.Sprintf("goroutines=%5d%s  heap_inuse=%4dMiB  conns_open=%d conns_in_use=%d rows=%d  pg_idle=%d pg_idle_in_tx=%d pg_xmin=%d  gc=%d",
+		n, delta, m.HeapInuse/1024/1024, st.OpenConnections, st.InUse, nRows, idle, idleInTx, withXmin, m.NumGC)
 }
 
 func logStats(db *sql.DB) {

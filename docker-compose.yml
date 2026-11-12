@@ -32,9 +32,44 @@ services:
       - "127.0.0.1:8093:8080"
     healthcheck: *healthcheck
 
+  db_postgres:
+    image: postgres:16-alpine
+    container_name: db_postgres
+    environment:
+      POSTGRES_USER: leak
+      POSTGRES_PASSWORD: leak
+      POSTGRES_DB: leak
+    command: ["postgres", "-c", "max_connections=100", "-c", "shared_buffers=32MB"]
+    shm_size: 256mb
+    ports:
+      - "127.0.0.1:5433:5432"
+    healthcheck: &pg_healthy
+      test: ["CMD-SHELL", "pg_isready -U leak -d leak"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+      start_period: 3s
+
+  tx_postgres:
+    image: postgres:16-alpine
+    container_name: tx_postgres
+    environment:
+      POSTGRES_USER: leak
+      POSTGRES_PASSWORD: leak
+      POSTGRES_DB: leak
+    command: ["postgres", "-c", "max_connections=100", "-c", "shared_buffers=32MB"]
+    shm_size: 256mb
+    ports:
+      - "127.0.0.1:5434:5432"
+    healthcheck: *pg_healthy
+
   db_leak:
     build: ./db_leak
     container_name: db_leak
+    depends_on:
+      db_postgres:
+        condition: service_healthy
+    command: ["-http", "0.0.0.0:8080", "-dsn", "postgres://leak:leak@db_postgres:5432/leak?sslmode=disable"]
     ports:
       - "127.0.0.1:8094:8080"
     healthcheck: *healthcheck
@@ -42,6 +77,10 @@ services:
   tx_leak:
     build: ./tx_leak
     container_name: tx_leak
+    depends_on:
+      tx_postgres:
+        condition: service_healthy
+    command: ["-http", "0.0.0.0:8080", "-dsn", "postgres://leak:leak@tx_postgres:5432/leak?sslmode=disable"]
     ports:
       - "127.0.0.1:8095:8080"
     healthcheck: *healthcheck
