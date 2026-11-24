@@ -80,15 +80,16 @@ func main() {
 // payload — небольшое тело, чтобы в профиле были буферы, а не гигабайты данных.
 var payload = bytes.Repeat([]byte("x"), 1024)
 
-// leakyCall повторяет баг с прода: ответ получен, Body не закрыт.
-// http.Get использует context.Background, поэтому завершение обработчика
-// не отменяет соединение и readLoop остаётся жить.
+// client.Get использует context.Background: завершение обработчика
+// не отменяет запрос, и readLoop ждёт, пока Body дочитают или закроют.
 func leakyCall(url string) error {
 	resp, err := client.Get(url)
 	if err != nil {
 		return err
 	}
-	_ = resp // Body не закрываем
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("downstream: %s", resp.Status)
+	}
 	return nil
 }
 
@@ -98,6 +99,9 @@ func fixedCall(url string) error {
 		return err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("downstream: %s", resp.Status)
+	}
 	_, err = io.Copy(io.Discard, resp.Body)
 	return err
 }

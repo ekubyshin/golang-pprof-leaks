@@ -18,12 +18,10 @@ func main() {
 
 	http.HandleFunc("/", index(*addr))
 	http.HandleFunc("/leak", func(w http.ResponseWriter, r *http.Request) {
-		leaky()
-		fmt.Fprintln(w, "ok")
+		fmt.Fprintf(w, "bytes=%d\n", len(leaky()))
 	})
 	http.HandleFunc("/fixed", func(w http.ResponseWriter, r *http.Request) {
-		fixed()
-		fmt.Fprintln(w, "ok")
+		fmt.Fprintf(w, "bytes=%d\n", len(fixed()))
 	})
 	http.HandleFunc("/gc", func(w http.ResponseWriter, r *http.Request) {
 		runtime.GC()
@@ -37,17 +35,42 @@ func main() {
 	log.Fatal(server.ListenAndServe())
 }
 
-// leaky запускает горутину на запрос. Писать в out некому, горутина не выходит
-// и удерживает буфер.
-func leaky() {
+// renderTime больше timeout: в демо обработчик всегда уходит по таймауту.
+const (
+	renderTime = 100 * time.Millisecond
+	timeout    = 50 * time.Millisecond
+)
+
+func leaky() []byte {
 	out := make(chan []byte)
 	go func() {
-		out <- bytes.Repeat([]byte("x"), 4*1024)
+		out <- render()
 	}()
+	select {
+	case b := <-out:
+		return b
+	case <-time.After(timeout):
+		return nil
+	}
 }
 
-func fixed() {
-	_ = bytes.Repeat([]byte("x"), 4*1024)
+func fixed() []byte {
+	out := make(chan []byte, 1)
+	go func() {
+		out <- render()
+	}()
+	select {
+	case b := <-out:
+		return b
+	case <-time.After(timeout):
+		return nil
+	}
+}
+
+// render изображает медленную зависимость.
+func render() []byte {
+	time.Sleep(renderTime)
+	return bytes.Repeat([]byte("x"), 4*1024)
 }
 
 func index(addr string) http.HandlerFunc {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	_ "net/http/pprof"
@@ -24,12 +25,14 @@ func main() {
 
 	http.HandleFunc("/", index(*addr))
 	http.HandleFunc("/leak", func(w http.ResponseWriter, r *http.Request) {
-		leaky()
-		fmt.Fprintln(w, "ok")
+		if err := leaky(w); err != nil {
+			log.Print(err)
+		}
 	})
 	http.HandleFunc("/fixed", func(w http.ResponseWriter, r *http.Request) {
-		fixed()
-		fmt.Fprintln(w, "ok")
+		if err := fixed(w); err != nil {
+			log.Print(err)
+		}
 	})
 	http.HandleFunc("/gc", func(w http.ResponseWriter, r *http.Request) {
 		runtime.GC()
@@ -43,22 +46,26 @@ func main() {
 	log.Fatal(server.ListenAndServe())
 }
 
-// leaky забывает cancel. Горутина ждёт ctx.Done() и не выходит,
-// а сам контекст остаётся ребёнком appCtx.
-func leaky() {
+func leaky(w io.Writer) error {
 	ctx, cancel := context.WithCancel(appCtx)
-	_ = cancel
 	go func() {
 		<-ctx.Done()
 	}()
+	if _, err := fmt.Fprintln(w, "ok"); err != nil {
+		cancel()
+		return err
+	}
+	return nil
 }
 
-func fixed() {
+func fixed(w io.Writer) error {
 	ctx, cancel := context.WithCancel(appCtx)
 	defer cancel()
 	go func() {
 		<-ctx.Done()
 	}()
+	_, err := fmt.Fprintln(w, "ok")
+	return err
 }
 
 func index(addr string) http.HandlerFunc {

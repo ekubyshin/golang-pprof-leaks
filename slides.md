@@ -74,6 +74,7 @@ style: |
   section.dense { font-size: 24px; }
   section.dense h1 { font-size: 34px; }
   section.dense li { margin: 0.16em 0; }
+  section.tight pre, section.tight pre code { font-size: 15px; }
   section.refs { font-size: 19px; padding: 36px 52px 30px; line-height: 1.3; }
   section.refs h1 { font-size: 30px; margin-bottom: 8px; }
   section.refs h2 { font-size: 22px; margin: 12px 0 2px; }
@@ -114,7 +115,7 @@ style: |
 
 1. Разбор инцидента на проде
 2. План разбора: метрики, логи, горутины, pprof
-3. Разберем причины утечек памяти
+3. Разберём причины утечек памяти
 4. Diff двух профилей
 5. Шпаргалка: heap, CPU, goroutine, diff
 6. Частые причины роста памяти
@@ -269,12 +270,11 @@ Graph называет функцию. Source раскладывает flat и c
 
 # Почему это держит память
 
-`Client.Get` создает запрос через NewRequest. Если в пуле есть соединение, то оно используется, если нет, то создается новое. `readLoop` ждёт EOF или `Close`. `writeLoop` ждёт следующую запись или закрытие соединения.
+`Client.Get` создаёт запрос через `NewRequest`. Если в пуле `Transport` есть свободное соединение, запрос идёт по нему, если нет — открывается новое. `readLoop` ждёт EOF или `Close`. `writeLoop` ждёт следующую запись или закрытие соединения.
 
 GC их не забирает: стек горутины — живой корень. Пока соединение не отпущено, `conn.serve` у downstream ждёт следующий запрос.
 
-
-`Get` идёт с `context.Background`. Отмена входящего запроса это соединение не закрывает.
+`NewRequest` берёт `context.Background`. Отмена входящего запроса это соединение не закрывает.
 
 ---
 
@@ -282,7 +282,7 @@ GC их не забирает: стек горутины — живой коре
 
 # Причины утечек
 
-Рассмотрим другие причины утечек памяти в Golang: горутина, Transport, context, Rows, транзакция.
+Рассмотрим другие причины утечек памяти в Go: горутина, Transport, context, Rows, транзакция.
 
 Шесть сервисов `*_leak`. Нагрузка снаружи, чтобы на счётчиках и в pprof было видно, как течь растёт.
 
@@ -299,7 +299,7 @@ GC их не забирает: стек горутины — живой коре
 | `db_leak` | 8094 | `sql.Rows` не закрыты |
 | `tx_leak` | 8095 | транзакция без `Commit` и `Rollback` |
 
-k6 закрывает ответы сервисов и сам память не копит. `/fixed` делает тот же вызов без утечки. pprof у каждого свой, например `127.0.0.1:8080/debug/pprof/`.
+k6 отбрасывает тела ответов (`discardResponseBodies`) и сам память не копит. `/fixed` делает тот же вызов без утечки. pprof у каждого свой, например `127.0.0.1:8080/debug/pprof/`.
 
 `db_leak` и `tx_leak` ходят каждый в свой Postgres. С хоста они доступны на `127.0.0.1:5433` и `127.0.0.1:5434`. У обоих `max_connections` = 100.
 
@@ -343,6 +343,8 @@ goroutines= 3305 (+3302)  heap_inuse=  28MiB
 
 ---
 
+<!-- _class: dense tight -->
+
 # `http_leak`: Body не закрыт
 
 ```go
@@ -351,7 +353,9 @@ func leakyCall(url string) error {
     if err != nil {
         return err
     }
-    _ = resp // Body не закрываем
+    if resp.StatusCode != http.StatusOK {
+        return fmt.Errorf("downstream: %s", resp.Status)
+    }
     return nil
 }
 
@@ -361,31 +365,42 @@ func fixedCall(url string) error {
         return err
     }
     defer resp.Body.Close()
+    if resp.StatusCode != http.StatusOK {
+        return fmt.Errorf("downstream: %s", resp.Status)
+    }
     _, err = io.Copy(io.Discard, resp.Body)
     return err
 }
 ```
 
-`Close` отпускает соединение. Чтение до EOF возвращает его в пул.
+`leakyCall` смотрит только на статус: Body не дочитан и не закрыт. В `fixedCall` `Close` отпускает соединение, чтение до EOF возвращает его в пул.
 
 ---
+
+<!-- _class: dense tight -->
 
 # `goroutine_leak`: канал без читателя
 
 ```go
-func leaky() {
+func leaky() []byte {
     out := make(chan []byte)
     go func() {
-        out <- bytes.Repeat([]byte("x"), 4*1024)
+        out <- render()
     }()
+    select {
+    case b := <-out:
+        return b
+    case <-time.After(timeout):
+        return nil
+    }
 }
 ```
 
-Читателя нет, отправка блокируется навсегда. Стек горутины — живой корень. В кадре заголовок среза, сами 4 КБ лежат в куче и из кадра достижимы.
+`render` в демо дольше `timeout`, обработчик уходит по таймауту. Читателя у `out` больше нет, отправка в небуферизованный канал блокируется навсегда. Стек горутины — живой корень. В кадре заголовок среза, сами 4 КБ лежат в куче и из кадра достижимы.
 
 В профиле горутин стек сверху вниз: `runtime.gopark`, `runtime.chansend`, `runtime.chansend1`, `main.leaky.func1`. В `debug=1` runtime-кадры сверху скрыты, первым идёт `main.leaky.func1`. При 20 RPS лог прибавляет около 40 горутин за две секунды.
 
-`/fixed` выделяет тот же буфер в обработчике и никуда его не сохраняет.
+В `/fixed` канал `make(chan []byte, 1)`: горутина кладёт значение в буфер и выходит.
 
 ---
 
@@ -406,21 +421,29 @@ func leakyCall(url string) error {
 
 ---
 
+<!-- _class: dense tight -->
+
 # `ctx_leak`: `cancel` не вызван
 
 ```go
-func leaky() {
+func leaky(w io.Writer) error {
     ctx, cancel := context.WithCancel(appCtx)
-    _ = cancel
-    go func() { <-ctx.Done() }()
+    go func() {
+        <-ctx.Done()
+    }()
+    if _, err := fmt.Fprintln(w, "ok"); err != nil {
+        cancel()
+        return err
+    }
+    return nil
 }
 ```
 
-`appCtx` живёт до конца процесса и держит дочерний контекст, пока не вызовут `cancel`. Горутина стоит на `<-ctx.Done()`.
+`cancel` вызывают только на ветке ошибки. `appCtx` живёт до конца процесса и держит дочерний контекст, пока не вызовут `cancel`. Горутина стоит на `<-ctx.Done()`. `go vet` ловит этот путь: «the cancel function is not used on all paths (possible context leak)».
 
 Профиль горутин показывает замыкание: обработчик уже вернулся, горутина — нет. Heap растёт медленно: на запрос в куче сотни байт — контекст, канал `Done`, структура горутины из `runtime.malg`. Стек горутины считается в `stack`, не в heap-профиле. При 20 RPS это около 40 горутин за две секунды.
 
-`/fixed` делает `defer cancel()` до выхода из функции.
+`/fixed` делает `defer cancel()` сразу после `WithCancel`.
 
 ---
 
@@ -699,7 +722,7 @@ func poll() {
 2. Логи, затем число и стеки горутин
 3. pprof с живого процесса: goroutine, heap, Source
 4. Diff двух снимков при том же RPS
-5. На ревью: один `Transport` с ненулевым `IdleConnTimeout`, `defer Close` у Body и Rows, `defer Rollback()` у `Tx`, чтение до EOF, `cancel()` у долгого контекста
+5. На ревью: один `Transport` с ненулевым `IdleConnTimeout`, `defer Close` у Body и Rows, `defer Rollback()` у `Tx`, чтение до EOF, `defer cancel()` у контекста, буфер у канала результата, который могут не дочитать
 
 Если процесс уже перезапустился, в разовом профиле утечки уже нет. Постоянный сбор тех же профилей оставляет снимки до рестарта.
 
@@ -731,8 +754,9 @@ func poll() {
 
 ## `goroutine_leak`: канал без читателя
 
-- [Спецификация Go: Send statements](https://go.dev/ref/spec#Send_statements) — «Communication blocks until the send can proceed. A send on an unbuffered channel can proceed if a receiver is ready.»
+- [Спецификация Go: Send statements](https://go.dev/ref/spec#Send_statements) — «Communication blocks until the send can proceed. A send on an unbuffered channel can proceed if a receiver is ready. A send on a buffered channel can proceed if there is room in the buffer.»
 - [Go blog: Pipelines, Stopping short](https://go.dev/blog/pipelines#stopping-short) — «Goroutines are not garbage collected; they must exit on their own.»
+- [Go blog: Timing out, moving on](https://go.dev/blog/concurrency-timeouts) — «The timeout channel is buffered with space for 1 value, allowing the timeout goroutine to send to the channel and then exit.»
 - [`runtime/chan.go:270`](https://github.com/golang/go/blob/go1.23.1/src/runtime/chan.go#L270) — `chansend` паркует горутину через `gopark` с `waitReasonChanSend`. Это кадры `runtime.chansend` и `runtime.gopark` в профиле
 
 ## `ctx_leak`: `cancel` не вызван
