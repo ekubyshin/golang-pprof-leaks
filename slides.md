@@ -74,6 +74,13 @@ style: |
   section.dense { font-size: 24px; }
   section.dense h1 { font-size: 34px; }
   section.dense li { margin: 0.16em 0; }
+  section.refs { font-size: 19px; padding: 36px 52px 30px; line-height: 1.3; }
+  section.refs h1 { font-size: 30px; margin-bottom: 8px; }
+  section.refs h2 { font-size: 22px; margin: 12px 0 2px; }
+  section.refs p { margin: 0.3em 0; }
+  section.refs li { margin: 0.14em 0; }
+  section.refs a { text-decoration: underline; }
+  section.refs a code { color: #0f766e; }
   .columns {
     display: grid;
     grid-template-columns: minmax(0, 0.92fr) minmax(0, 1.08fr);
@@ -200,7 +207,7 @@ RPS объясняет рост только вместе с размером о
 - Утечка — повторяющийся стек с большим счётчиком
 - У клиента с незакрытым Body их два: `readLoop` и `writeLoop`. `conn.serve` живёт в downstream
 
-`debug=2` печатает аргументы кадров шестнадцатеричными словами. Полный дамп в общий канал лучше не класть.
+`debug=1` группирует одинаковые стеки и печатает счётчик. `debug=2` печатает каждую горутину отдельно в формате паники: причину ожидания, аргументы кадров шестнадцатеричными словами и примерные минуты ожидания. Минуты считаются от первого GC, заставшего горутину заблокированной, и печатаются от одной. Повторяющиеся стеки удобнее искать в `debug=1`.
 
 Несколько `readLoop` — обычный пул keep-alive. Тысячи при ровном RPS — соединения не возвращаются в пул.
 
@@ -213,9 +220,9 @@ RPS объясняет рост только вместе с размером о
 <div class="columns">
 <div>
 
-Снимок heap, режим Graph.
+Профиль heap, режим Graph. Сначала смотрим sample: `inuse_space` — живые байты на последний GC, `alloc_space` — всё выделенное со старта.
 
-Крупные узлы — функции, в которых выделили ещё живые байты. От узла переходим в Source.
+Крупный шрифт — большой flat: функция сама выделила байты. Красный — большой cum. От узла переходим в Source.
 
 Для Graph на машине нужен `dot` из Graphviz. Top, Flame Graph и Source работают и без него.
 
@@ -236,9 +243,11 @@ RPS объясняет рост только вместе с размером о
 <div class="columns">
 <div>
 
-Graph называет функцию. В heap Source показывает строку аллокации.
+Graph называет функцию. Source раскладывает flat и cum по строкам: в heap flat стоит на строке аллокации.
 
-Это место, где память выделили. Вызов, который забыл `Close`, может быть выше по стеку аллокации или уже вернулся. В профиле горутин Source открывает строку, на которой горутина стоит.
+Исходники pprof берёт с локального диска. На скрине 874 MB стоят на `io.go:699`, где в Go 1.22+ `nopCloserWriterTo.Close`. В Go 1.20 это строка `append` внутри `ReadAll`. Версия Go на машине должна совпадать с версией сборки.
+
+Вызов, который забыл `Close`, может быть выше по стеку аллокации или уже вернулся. В профиле горутин cum своей функции стоит на строке, где горутина заблокирована.
 
 </div>
 <div>
@@ -254,15 +263,16 @@ Graph называет функцию. В heap Source показывает ст�
 
 Исходящий ответ получен, тело не дочитано и не закрыто. Соединение осталось за процессом вместе с горутинами `net/http`.
 
+Признак в профиле горутин — тысячи `persistConn.readLoop` и `writeLoop`. В heap по `inuse_space` рядом `bufio` и `Transport.dialConn`.
+
 ---
 
 # Почему это держит память
 
-`Client.Get` поднимает постоянное соединение. `readLoop` ждёт EOF или `Close`. `writeLoop` ждёт следующую запись или закрытие соединения.
+`Client.Get` создает запрос через NewRequest. Если в пуле есть соединение, то оно используется, если нет, то создается новое. `readLoop` ждёт EOF или `Close`. `writeLoop` ждёт следующую запись или закрытие соединения.
 
 GC их не забирает: стек горутины — живой корень. Пока соединение не отпущено, `conn.serve` у downstream ждёт следующий запрос.
 
-У клиента на запрос остаются `readLoop`, `writeLoop`, буферы `bufio` и один дескриптор. В демо downstream в том же процессе: добавляются `conn.serve` и второй дескриптор, в логе это +3 горутины.
 
 `Get` идёт с `context.Background`. Отмена входящего запроса это соединение не закрывает.
 
@@ -272,17 +282,9 @@ GC их не забирает: стек горутины — живой коре
 
 # Причины утечек
 
-Инцидент на проде — незакрытый Body. Дальше те же корни в других местах: горутина, Transport, cancel, Rows, транзакция.
+Рассмотрим другие причины утечек памяти в Golang: горутина, Transport, context, Rows, транзакция.
 
 Шесть сервисов `*_leak`. Нагрузка снаружи, чтобы на счётчиках и в pprof было видно, как течь растёт.
-
-<!--
-Сначала TARGET_PATH=/fixed DURATION=30s docker compose up -d
-Потом docker compose down и docker compose up -d
-Логи: docker compose logs -f http_leak
-и так же goroutine_leak, client_leak, ctx_leak, db_leak, tx_leak.
-Команды есть в README.
--->
 
 ---
 
@@ -299,7 +301,7 @@ GC их не забирает: стек горутины — живой коре
 
 k6 закрывает ответы сервисов и сам память не копит. `/fixed` делает тот же вызов без утечки. pprof у каждого свой, например `127.0.0.1:8080/debug/pprof/`.
 
-`db_leak` и `tx_leak` ходят каждый в свой Postgres: `127.0.0.1:5433` и `127.0.0.1:5434`. У обоих `max_connections` = 100.
+`db_leak` и `tx_leak` ходят каждый в свой Postgres. С хоста они доступны на `127.0.0.1:5433` и `127.0.0.1:5434`. У обоих `max_connections` = 100.
 
 ---
 
@@ -314,7 +316,7 @@ docker compose down && docker compose up -d
 
 Лог самого шумного: `docker compose logs -f http_leak`. У остальных контейнер называется так же, как сервис.
 
-`(+N)` считается от старта процесса и пишется в лог. `GET /gc` делает сборку мусора и печатает снимок без `(+N)`. У `db_leak` в этой строке ещё `conns_in_use`, `rows` и `pg_idle`, у `tx_leak` — `conns_in_use`, `tx` и `pg_idle_in_tx`. Сравниваем `/fixed` и `/leak` на свежем процессе: уже открытые соединения и горутины живут до его завершения.
+`(+N)` считается от старта процесса и пишется в лог. `GET /gc` делает сборку мусора и печатает снимок без `(+N)`. У `db_leak` в этой строке ещё `conns_in_use` и `pg_idle`, у `tx_leak` — `conns_in_use`, `pg_idle_in_tx` и `pg_xmin`. Сравниваем `/fixed` и `/leak` на свежем процессе: уже открытые соединения и горутины живут до его завершения.
 
 ---
 
@@ -322,13 +324,13 @@ docker compose down && docker compose up -d
 
 # `http_leak` при 50 RPS
 
-`/fixed` держится на полке:
+`/fixed` держится на полке. Здесь и ниже из строк лога убраны `stack`, `sys` и `gc`:
 
 ```text
 goroutines=   10 (   +7)  heap_inuse=   1MiB
 ```
 
-`/leak` прибавляет около 300 горутин на строку. 50 запросов в секунду × 3 горутины × 2 секунды:
+`/leak` прибавляет около 300 горутин на строку: 50 запросов в секунду × 3 горутины × 2 секунды. Строки взяты выборочно:
 
 ```text
 goroutines=    5 (   +2)  heap_inuse=   1MiB
@@ -381,7 +383,7 @@ func leaky() {
 
 Читателя нет, отправка блокируется навсегда. Стек горутины — живой корень. В кадре заголовок среза, сами 4 КБ лежат в куче и из кадра достижимы.
 
-В профиле горутин лист — `runtime.chansend` или `chansend1`, сразу под ним своё замыкание. При 20 RPS лог прибавляет около 40 горутин за две секунды.
+В профиле горутин стек сверху вниз: `runtime.gopark`, `runtime.chansend`, `runtime.chansend1`, `main.leaky.func1`. В `debug=1` runtime-кадры сверху скрыты, первым идёт `main.leaky.func1`. При 20 RPS лог прибавляет около 40 горутин за две секунды.
 
 `/fixed` выделяет тот же буфер в обработчике и никуда его не сохраняет.
 
@@ -398,7 +400,7 @@ func leakyCall(url string) error {
 
 `do` закрывает Body и читает его до EOF. У нулевого `Transport` `IdleConnTimeout` равен 0: ноль значит «без ограничения», по простою соединение не закрывается.
 
-Имена кадров те же: `readLoop`, `writeLoop`, `conn.serve`. Body уже закрыт, соединение лежит в пуле этого `Transport`. В heap виден `http.Transport` из `leakyCall`. Объект маленький, профиль показывает место аллокации выборкой.
+Имена кадров те же: `readLoop`, `writeLoop`, `conn.serve`. Body уже закрыт, соединение лежит в пуле этого `Transport`, и `readLoop` ждёт данных из сокета в `bufio.(*Reader).Peek`. У `http_leak` он ждёт в `select`, пока прочитают Body. В heap виден `http.Transport` из `leakyCall`. Объект маленький, профиль показывает место аллокации выборкой.
 
 `/fixed` создаёт клиент один раз при старте, с ненулевым `IdleConnTimeout`. Пустой `Client.Transport` — это общий `DefaultTransport`.
 
@@ -416,7 +418,7 @@ func leaky() {
 
 `appCtx` живёт до конца процесса и держит дочерний контекст, пока не вызовут `cancel`. Горутина стоит на `<-ctx.Done()`.
 
-Профиль горутин показывает замыкание: обработчик уже вернулся, горутина — нет. Heap часто пустой: объекты меньше среднего шага сэмпла. При 20 RPS это около 40 горутин за две секунды.
+Профиль горутин показывает замыкание: обработчик уже вернулся, горутина — нет. Heap растёт медленно: на запрос в куче сотни байт — контекст, канал `Done`, структура горутины из `runtime.malg`. Стек горутины считается в `stack`, не в heap-профиле. При 20 RPS это около 40 горутин за две секунды.
 
 `/fixed` делает `defer cancel()` до выхода из функции.
 
@@ -427,21 +429,54 @@ func leaky() {
 # `db_leak`: `Rows` не закрыты
 
 ```go
-func leaky(db *sql.DB) error {
+func leaky(db *sql.DB) ([]item, error) {
     rows, err := db.QueryContext(context.Background(), query)
     if err != nil {
-        return err
+        return nil, err
     }
-    openRows = append(openRows, rows)
-    return nil
+    var items []item
+    for rows.Next() {
+        var it item
+        if err := rows.Scan(&it.ID, &it.Name, &it.Payload); err != nil {
+            return nil, err
+        }
+        items = append(items, it)
+        if len(items) == pageSize {
+            break //Выходим из цикла, чтобы не вызывать Next
+        }
+    }
+    return items, rows.Err()
 }
 ```
 
-`Query` держит соединение до `Rows.Close`. Срез хранит `Rows`, драйвер держит уже полученный результат. Сборщик сам `Close` не вызывает.
+Обычный цикл: строки мапятся в `item` и складываются в слайс. В таблице 8 строк, `pageSize` = 5, цикл выходит по `break`. `Close` нет.
 
-Горутины почти стоят. В логе растут `rows`, `conns_in_use` и `pg_idle`, пока есть слоты. `pg_idle` считает чужие idle-сессии и на утечке идёт рядом с `rows`. На сервере сессия `idle`: запрос завершён, `pg_idle_in_tx` и `pg_xmin` остаются 0. Около 100 соединений Postgres отказывает, счётчики встают. В heap видны `pgx` и `database/sql`. `GET /gc` эти счётчики не уменьшает.
+---
 
-`/fixed` делает `defer rows.Close()` и дочитывает выборку. У `*os.File` финализатор закрывает дескриптор, когда ссылка пропадает. Пока ссылка жива, дескриптор занят.
+<!-- _class: dense -->
+
+# Когда `Rows` отдают соединение
+
+`QueryContext` берёт соединение из пула и отдаёт его `Rows`. В пул оно вернётся, только когда `Rows` закроют. Закрываются они в четырёх случаях:
+
+- явный `rows.Close()`
+- `Next` вернул `false` в конце выборки, и следующего набора строк нет
+- `Next` получил ошибку драйвера
+- отменили контекст запроса: `Rows` закрывает горутина `awaitDone`. Её запускают, только если у контекста есть `Done`
+
+`break`, `return` при ошибке `Scan` или маппинга, паника в цикле — ни один из этих выходов `Rows` не закрывает. Финализатора у `Rows` нет: если они стали мусором незакрытыми, соединение остаётся занятым. `DB` хранит его в своём реестре и считает в `InUse`.
+
+---
+
+<!-- _class: dense -->
+
+# `db_leak`: что происходит в демо
+
+`break` срабатывает раньше, чем `Next` вернёт `false`. Контекст `Background`, поэтому горутины `awaitDone` нет. После выхода из `leaky` переменная `rows` недостижима, а соединение так и остаётся занятым.
+
+Горутины почти стоят. В логе растут `conns_in_use` и `pg_idle`, пока есть слоты. `pg_idle` считает idle-сессии базы, кроме той, с которой снимаем статистику, и на утечке идёт рядом с `conns_in_use`. На сервере сессия `idle`: запрос завершён, `pg_idle_in_tx` и `pg_xmin` остаются 0. Около 100 соединений Postgres отказывает, счётчики встают. В heap видны `pgx` и `database/sql`. `GET /gc` эти счётчики не уменьшает.
+
+`/fixed` отличается одной строкой: `defer rows.Close()`. `break` остаётся, `Close` отпускает соединение на любом выходе из функции. Страницу правильнее резать через `LIMIT` в SQL, но `defer rows.Close()` нужен и тогда: выход по ошибке `Scan` тоже не закрывает `Rows`.
 
 ---
 
@@ -451,14 +486,14 @@ func leaky(db *sql.DB) error {
 
 `BeginTx` держит соединение пула, пока нет `Commit` или `Rollback`. `Begin` и `BeginTx(context.Background())` не отменяются вместе с входящим запросом.
 
-`database/sql` на каждую транзакцию запускает `(*Tx).awaitDone`. Горутина стоит на `ctx.Done()`. В логе растут `tx`, `conns_in_use`, число горутин и `pg_idle_in_tx`. После `GET /gc` куча остаётся в единицах МиБ: стеки живут отдельно от `heap_inuse`.
+`database/sql` на каждую транзакцию запускает `(*Tx).awaitDone`. Горутина стоит на `ctx.Done()`. В логе растут `conns_in_use`, число горутин, `pg_idle_in_tx` и `pg_xmin`. После `GET /gc` `heap_inuse` остаётся в единицах МиБ: транзакций не больше 100, а стеки горутин в `heap_inuse` не входят.
 
 Для базы это отдельный ущерб:
 
 - сессия `idle in transaction` занимает слот. В демо `max_connections` = 100, слоты кончаются раньше памяти приложения
 - `INSERT` новой строки держит xid и табличный `RowExclusiveLock` до конца транзакции. Соседний `INSERT` проходит, строка снаружи не видна
-- xid держит горизонт очистки: обычный `VACUUM` оставляет версии, умершие после его старта. В логе `pg_xmin` остаётся 0
-- этот `RowExclusiveLock` заставляет ждать `VACUUM FULL`, `ALTER` и `DROP`. `UPDATE` существующей строки держал бы ещё блокировку самой строки
+- открытая транзакция не даёт `VACUUM` убрать недавно умершие версии строк. В демо у сессии есть и xid, и снимок: `pg_xmin` растёт вместе с `pg_idle_in_tx`. Если снимка нет, `backend_xmin` пуст, тогда смотрят `backend_xid`
+- этот `RowExclusiveLock` заставляет ждать `VACUUM FULL`, `DROP`, `TRUNCATE` и большинство форм `ALTER TABLE`. `UPDATE` существующей строки держал бы ещё блокировку самой строки
 
 ---
 
@@ -467,25 +502,41 @@ func leaky(db *sql.DB) error {
 # `tx_leak`: транзакция не закрыта
 
 ```go
-func leaky(db *sql.DB) error {
+func leaky(db *sql.DB, payload string) error {
     tx, err := db.BeginTx(context.Background(), nil)
     if err != nil {
         return err
     }
-    _, err = tx.ExecContext(context.Background(),
-        `INSERT INTO events(payload) VALUES ($1)`, "x")
-    if err != nil {
+    if _, err := tx.ExecContext(context.Background(), insertEvent, payload); err != nil {
         _ = tx.Rollback()
         return err
     }
-    openTx = append(openTx, tx)
-    return nil
+    var n int
+    if err := tx.QueryRowContext(context.Background(), countEvents, payload).Scan(&n); err != nil {
+        _ = tx.Rollback()
+        return err
+    }
+    // Дубль не сохраняем.
+    if n > 1 {
+        return nil
+    }
+    return tx.Commit()
 }
 ```
 
-`/fixed` делает `defer tx.Rollback()` и затем `Commit`. Срез нужен для счётчика: `awaitDone` и так держит `*sql.Tx`.
+---
 
-При 10 RPS за две секунды около +20 горутин и +20 `conns_in_use`, пока есть слоты. `conns_in_use` встаёт на 100, дальше Postgres отвечает отказом. `GET /gc` счётчики не уменьшает.
+<!-- _class: dense -->
+
+# `tx_leak`: что происходит в демо
+
+`Rollback` расставлен вручную на каждой ветке, а ветку с дублем пропустили: она выходит без `Commit` и `Rollback`. Первый запрос коммитит `signup`, каждый следующий видит дубль и оставляет транзакцию открытой.
+
+Сама она не откатится. `*sql.Tx` держит горутина `awaitDone`: она ждёт отмены контекста транзакции, а его отменяют только `Commit`, `Rollback` или родительский контекст. `Background` не отменяется никогда.
+
+При 10 RPS за две секунды около +20 горутин, `conns_in_use`, `pg_idle_in_tx` и `pg_xmin`, пока есть слоты. `conns_in_use` встаёт на 100, дальше Postgres отвечает отказом. `GET /gc` счётчики не уменьшает.
+
+`/fixed` ставит `defer tx.Rollback()` сразу после `BeginTx` вместо ручных `Rollback`. Ветка с дублем откатывается, а после `Commit` отложенный `Rollback` возвращает `ErrTxDone` и ничего не делает.
 
 ---
 
@@ -503,7 +554,7 @@ go tool pprof -http=127.0.0.1:9091 http://127.0.0.1:8080/debug/pprof/goroutine
 go tool pprof -http=127.0.0.1:9090 http://127.0.0.1:8080/debug/pprof/heap
 ```
 
-У `db_leak` горутины почти стоят: смотрите `conns_in_use` и heap. У `tx_leak` рядом с `conns_in_use` растёт `(*Tx).awaitDone`. У `ctx_leak` горутины растут, а heap часто пустой.
+У `db_leak` горутины почти стоят: смотрите `conns_in_use` и heap. У `tx_leak` рядом с `conns_in_use` растёт `(*Tx).awaitDone`. У `ctx_leak` горутины растут, а heap почти не меняется.
 
 На этих утечках CPU-профиль почти пустой: горутины спят. Их показывает профиль горутин.
 
@@ -531,9 +582,9 @@ go tool pprof -http=127.0.0.1:9091 -diff_base \
   profiles/goroutine1.pb.gz profiles/goroutine2.pb.gz
 ```
 
-`-base` вычитает первый файл из второго: в `-top` колонка cum — сколько стеков прибавилось.
+Оба флага вычитают первый файл из второго и работают и в `-top`, и в `-http`. В `-top -cum` колонка cum — сколько стеков прибавилось.
 
-`-diff_base` нужен веб-интерфейсу. В текстовом top проценты там легко больше 100%: знаменатель — размер базового снимка. Читайте абсолютные числа.
+`-diff_base` считает проценты от базового снимка, поэтому они легко больше 100%: читайте абсолютные числа. Flame Graph с ним закрашивает прирост красным, убыль зелёным. `-base` документация pprof советует для накопительных профилей одного процесса.
 
 ---
 
@@ -553,7 +604,7 @@ go tool pprof -http=127.0.0.1:9091 -diff_base \
 
 `alloc_space` за ту же паузу часто показывает сам сбор профиля: `runtime/pprof`, `compress/flate`. Для утечки берём `inuse_space`.
 
-В демо куча сэмплируется в среднем каждые 64 КБ. На проде значение по умолчанию — 512 КБ, мелкие буферы попадают реже. Профиль горутин учитывает все горутины.
+В демо `runtime.MemProfileRate` = 64 КБ: в среднем один сэмпл на 64 КБ выделенного. По умолчанию — 512 КБ, мелкие буферы попадают реже. Профиль горутин учитывает все горутины.
 
 ---
 
@@ -561,18 +612,18 @@ go tool pprof -http=127.0.0.1:9091 -diff_base \
 
 # Diff на остальных сервисах
 
-Та же пара снимков: `./scripts/pprof-diff.sh client_leak goroutine`.
+Пару снимков со всех шести снимает `./scripts/capture-profiles.sh`, UI для одного — `./scripts/pprof-diff.sh client_leak goroutine`.
 
 | Сервис | Goroutine | Heap `inuse_space` |
 | --- | --- | --- |
 | `http_leak` | `readLoop`, `writeLoop`, `conn.serve` | `bufio`, `dialConn` |
 | `goroutine_leak` | `chansend` и замыкание `leaky` | `bytes.Repeat` |
-| `client_leak` | те же три кадра, что у `http_leak` | плюс `http.Transport` |
-| `ctx_leak` | приём из `ctx.Done()` | часто пусто |
+| `client_leak` | те же три кадра, `readLoop` в `Peek` | плюс `http.Transport` |
+| `ctx_leak` | приём из `ctx.Done()` | мало: `runtime.malg`, `context` |
 | `db_leak` | новой широкой полосы нет | `pgx`, `database/sql` |
 | `tx_leak` | `(*Tx).awaitDone` | мало: буферы `pgx` |
 
-Одинаковые `readLoop` у `http_leak` и `client_leak` разделяет heap: во втором на запрос появляется `Transport`.
+`readLoop` у `http_leak` и `client_leak` расходятся ниже по стеку: у первого `runtime.selectgo` (ждёт Body), у второго `bufio.(*Reader).Peek` (соединение в пуле). Heap добавляет второй признак: в `client_leak` на запрос появляется `Transport`.
 
 Пустой goroutine-diff при растущем `conns_in_use` — это `db_leak`: смотрите heap и статистику пула. У `tx_leak` рядом растёт `awaitDone`.
 
@@ -587,12 +638,12 @@ go tool pprof -http=127.0.0.1:9091 -diff_base \
 | **heap** | `/debug/pprof/heap` | Живые объекты. Утечка — рост `inuse_space` |
 | **cpu** | `/debug/pprof/profile?seconds=20` | Кто занимает процессор |
 | **goroutine** | `/debug/pprof/goroutine` | Какие стеки не завершаются |
-| **diff** | `-base` в терминале, `-diff_base` в UI | Что изменилось между двумя снимками |
+| **diff** | `-base` или `-diff_base` | Что изменилось между двумя снимками |
 
 Режимы UI: **Top**, **Graph**, **Flame Graph**, **Source**.
 
-`allocs` / `alloc_space` включают уже собранный мусор и копят байты с старта процесса. Давление за окно — diff двух снимков.
-CPU-профиль на 20 секунд заметно грузит процесс. Снимайте pprof с localhost или с admin-порта.
+`allocs` / `alloc_space` включают уже собранный мусор и копят байты со старта процесса. Давление за окно — diff двух снимков.
+CPU-профиль добавляет накладные расходы: их стоит измерить до включения на проде. Снимайте pprof с localhost или с admin-порта.
 Ещё есть `block` и `mutex`: оба выключены, пока их явно не включат в рантайме.
 
 ---
@@ -604,13 +655,13 @@ CPU-профиль на 20 секунд заметно грузит процес
 1. **Горутины** запускаются на запрос и не выходят: канал, `WaitGroup`, вызов без таймаута
 2. **Новый `Transport` на запрос** с нулевым `IdleConnTimeout`: простой без предела. Пустой `Client.Transport` — общий `DefaultTransport`
 3. **`resp.Body`** не закрыт
-4. **`sql.Rows` без `Close`** и **`Tx` без `Commit`/`Rollback`** держат соединение базы. Файл без `Close` держит дескриптор, пока жива ссылка
+4. **`sql.Rows` без `Close`** и **`Tx` без `Commit`/`Rollback`** держат соединение базы. Файл без `Close` держит дескриптор: финализатор может закрыть его после сборки, срок не гарантирован
 5. **Map, кэш, очередь** без верхней границы и без TTL
-6. **Вечный `time.Tick` / `NewTicker`.** Горутина держит тикер. С Go 1.23 тикер без ссылок собирает GC
+6. **Вечный `time.Tick` / `NewTicker`.** Горутина держит тикер. При `go 1.23+` в `go.mod` тикер без ссылок собирает GC
 7. **Короткий срез** удерживает большой backing array
-8. **`cancel` не вызван.** `WithCancel` от долгого родителя держит дочерний контекст, пока жив родитель. Горутина на `ctx.Done()` не выходит. `WithTimeout` без `cancel` держит таймер до дедлайна
+8. **`cancel` не вызван.** `WithCancel` от долгого родителя держит дочерний контекст, пока родитель не отменён. Горутина на `ctx.Done()` не выходит. `WithTimeout` без `cancel` держит таймер до дедлайна
 
-Прямая вверх при ровном RPS — накопление. Полка после GC — кэш или пул соединений. `sync.Pool` очищается на сборке. RSS пода может остаться выше `heap_inuse`.
+Прямая вверх при ровном RPS — накопление. Полка после GC — кэш или пул соединений. `sync.Pool` отдаёт объекты сборщику: с Go 1.13 они переживают одну сборку в victim cache и уходят на следующей. RSS пода может остаться выше `heap_inuse`.
 
 ---
 
@@ -626,7 +677,7 @@ var cache = map[string][]byte{}
 func put(id string, body []byte) { cache[id] = body }
 ```
 
-**Вечный `time.Tick`.** Цикл держит канал, тикер живёт вместе с горутиной. С Go 1.23 тикер без ссылок забирает сборщик, `Stop` останавливает его раньше.
+**Вечный `time.Tick`.** Цикл держит канал, тикер живёт вместе с горутиной. Память растёт, если такой `poll` запускают на каждый запрос или объект. При `go 1.23+` в `go.mod` тикер без ссылок забирает сборщик, `Stop` останавливает его раньше.
 
 ```go
 func poll() {
@@ -650,4 +701,59 @@ func poll() {
 4. Diff двух снимков при том же RPS
 5. На ревью: один `Transport` с ненулевым `IdleConnTimeout`, `defer Close` у Body и Rows, `defer Rollback()` у `Tx`, чтение до EOF, `cancel()` у долгого контекста
 
-Если процесс уже перезапустился, разовый профиль пустой. Постоянный сбор тех же профилей оставляет снимки до рестарта.
+Если процесс уже перезапустился, в разовом профиле утечки уже нет. Постоянный сбор тех же профилей оставляет снимки до рестарта.
+
+---
+
+<!-- _class: refs -->
+
+# Источники: HTTP
+
+Строки исходников — Go 1.23.1, версия из Dockerfile. Ссылки ведут на тег `go1.23.1`.
+
+## `http_leak`: Body не закрыт
+
+- [net/http: `Client.Do`](https://pkg.go.dev/net/http#Client.Do) — «Body which the user is expected to close. If the Body is not both read to EOF and closed, the Client's underlying RoundTripper (typically Transport) may not be able to re-use a persistent TCP connection»
+- [`response.go:59–64`](https://github.com/golang/go/blob/go1.23.1/src/net/http/response.go#L59-L64) — «It is the caller's responsibility to close Body»
+- [`transport.go:2322–2340`](https://github.com/golang/go/blob/go1.23.1/src/net/http/transport.go#L2322-L2340) — `readLoop` ждёт в `select`: Body дочитан или закрыт, отменён контекст запроса, закрыто соединение
+
+## `client_leak`: свой `Transport` на запрос
+
+- [net/http: `Transport`](https://pkg.go.dev/net/http#Transport) — «Transports should be reused instead of created as needed». Про `Client` то же: [`client.go:33–35`](https://github.com/golang/go/blob/go1.23.1/src/net/http/client.go#L33-L35)
+- [`transport.go:220–224`](https://github.com/golang/go/blob/go1.23.1/src/net/http/transport.go#L220-L224) — `IdleConnTimeout`: «Zero means no limit»
+- [`transport.go:2205`](https://github.com/golang/go/blob/go1.23.1/src/net/http/transport.go#L2205) — у простаивающего соединения `readLoop` ждёт в `pc.br.Peek(1)`
+
+---
+
+<!-- _class: refs -->
+
+# Источники: горутины и контекст
+
+## `goroutine_leak`: канал без читателя
+
+- [Спецификация Go: Send statements](https://go.dev/ref/spec#Send_statements) — «Communication blocks until the send can proceed. A send on an unbuffered channel can proceed if a receiver is ready.»
+- [Go blog: Pipelines, Stopping short](https://go.dev/blog/pipelines#stopping-short) — «Goroutines are not garbage collected; they must exit on their own.»
+- [`runtime/chan.go:270`](https://github.com/golang/go/blob/go1.23.1/src/runtime/chan.go#L270) — `chansend` паркует горутину через `gopark` с `waitReasonChanSend`. Это кадры `runtime.chansend` и `runtime.gopark` в профиле
+
+## `ctx_leak`: `cancel` не вызван
+
+- [context: обзор пакета](https://pkg.go.dev/context#pkg-overview) — «Calling the CancelFunc cancels the child and its children, removes the parent's reference to the child, and stops any associated timers. Failing to call the CancelFunc leaks the child and its children until the parent is canceled or the timer fires. The go vet tool checks that CancelFuncs are used on all control-flow paths.»
+- [`context.go:488`](https://github.com/golang/go/blob/go1.23.1/src/context/context.go#L488) — `propagateCancel` записывает дочерний контекст в `children` родителя: `appCtx` держит его, пока не вызовут `cancel`
+
+---
+
+<!-- _class: refs -->
+
+# Источники: база
+
+## `db_leak`: `Rows` не закрыты
+
+- [Go: Querying for data, multiple rows](https://go.dev/doc/database/querying#multiple_rows) — «Looping all the way through the rows also closes it implicitly, but it is better to use defer to make sure rows is closed no matter what.»
+- [database/sql: `Rows.Close`](https://pkg.go.dev/database/sql#Rows.Close) — «If Rows.Next is called and returns false and there are no further result sets, the Rows are closed automatically»
+- [`sql.go:2922`](https://github.com/golang/go/blob/go1.23.1/src/database/sql/sql.go#L2922) — `Rows` владеет соединением: «owned; must call releaseConn when closed to release». [`sql.go:3044–3077`](https://github.com/golang/go/blob/go1.23.1/src/database/sql/sql.go#L3044-L3077) — `nextLocked` закрывает на EOF и ошибке драйвера. [`sql.go:3391–3396`](https://github.com/golang/go/blob/go1.23.1/src/database/sql/sql.go#L3391-L3396) — ошибка `Scan` `Rows` не закрывает
+
+## `tx_leak`: транзакция не закрыта
+
+- [Go: Executing transactions, example](https://go.dev/doc/database/execute-transactions#example) — «Defer the transaction's rollback. If the transaction succeeds, it will be committed before the function exits, making the deferred rollback call a no-op.»
+- [database/sql: `Tx`](https://pkg.go.dev/database/sql#Tx) — «A transaction must end with a call to Tx.Commit or Tx.Rollback». [`sql.go:1917`](https://github.com/golang/go/blob/go1.23.1/src/database/sql/sql.go#L1917) — `go tx.awaitDone()`, [`sql.go:2199–2214`](https://github.com/golang/go/blob/go1.23.1/src/database/sql/sql.go#L2199-L2214) — горутина ждёт `tx.ctx.Done()`
+- PostgreSQL 16: [`idle_in_transaction_session_timeout`](https://www.postgresql.org/docs/16/runtime-config-client.html#GUC-IDLE-IN-TRANSACTION-SESSION-TIMEOUT) — «an open transaction prevents vacuuming away recently-dead tuples that may be visible only to this transaction». [Table-level locks](https://www.postgresql.org/docs/16/explicit-locking.html#LOCKING-TABLES) — с чем конфликтует `ROW EXCLUSIVE`
